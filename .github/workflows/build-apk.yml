@@ -1,44 +1,125 @@
-name: Build dev APK
+name: Sync upstream dev and build Release
 on:
+  schedule:
+    - cron: '23 * * * *'
   workflow_dispatch:
   push:
     branches: [dev]
 permissions:
   contents: read
 concurrency:
-  group: apk-${{ github.ref }}
-  cancel-in-progress: true
+  group: dev-release
+  cancel-in-progress: false
 env:
   CI: "true"
 jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      build: ${{ steps.sync.outputs.build }}
+      source: ${{ steps.sync.outputs.source }}
+      upstream: ${{ steps.sync.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - name: Merge upstream and check successful build marker
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/Sesame-AG/Sesame-AG.git
+          git fetch upstream dev
+          upstream_sha=$(git rev-parse upstream/dev)
+          git merge --no-edit upstream/dev
+          git push origin HEAD:dev
+          echo "source=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream_sha" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" != schedule ]] || ! git show-ref --verify --quiet "refs/tags/apk-release-$upstream_sha"; then
+            echo 'build=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'build=false' >> "$GITHUB_OUTPUT"
+          fi
   build:
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.sync.outputs.source }}
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-java@v5
         with:
           distribution: oracle
-          java-version: "17.0.1"
+          java-version: '17.0.1'
       - uses: android-actions/setup-android@v3
         with:
-          packages: "platform-tools platforms;android-37.0 build-tools;37.0.0"
+          packages: 'platform-tools platforms;android-37.0 build-tools;37.0.0'
       - uses: gradle/actions/setup-gradle@v4
-      - name: Build debug APKs
+      - name: Build Release APKs
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace :app:assembleDebug
-      - name: Record APK checksums
+          ./gradlew --no-daemon --stacktrace :app:assembleRelease
+      - name: Sign and verify Release APKs
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          EXPECTED_CERT: ${{ vars.RELEASE_CERT_SHA256 }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream }}
+          SOURCE_SHA: ${{ needs.sync.outputs.source }}
+        shell: bash
         run: |
-          cd app/build/outputs/apk/debug
-          sha256sum *.apk > SHA256SUMS.txt
+          set -euo pipefail
+          key="$RUNNER_TEMP/release.pfx"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$key"
+          chmod 600 "$key"
+          tools="$ANDROID_HOME/build-tools/37.0.0"
+          mkdir -p release-apks
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*.apk)
+          (( ${#apks[@]} > 0 ))
+          for apk in "${apks[@]}"; do
+            output="release-apks/$(basename "$apk" .apk)-signed.apk"
+            "$tools/apksigner" sign --ks "$key" --ks-type PKCS12 --ks-pass env:KEYSTORE_PASSWORD --out "$output" "$apk"
+            "$tools/apksigner" verify --verbose --print-certs "$output" > "$RUNNER_TEMP/signature.txt"
+            actual=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/signature.txt" | tr '[:lower:]' '[:upper:]')
+            [[ "$actual" == "$EXPECTED_CERT" ]]
+            "$tools/aapt2" dump badging "$output" > "$RUNNER_TEMP/badging.txt"
+            if grep -q '^application-debuggable' "$RUNNER_TEMP/badging.txt"; then
+              echo 'Refusing debuggable APK' >&2
+              exit 1
+            fi
+          done
+          printf 'Upstream dev: %s\nFork source: %s\nSigning certificate SHA-256: %s\nBuild type: release (self-signed fork, not upstream official)\n' "$UPSTREAM_SHA" "$SOURCE_SHA" "$EXPECTED_CERT" > release-apks/BUILD-INFO.txt
+          (cd release-apks && sha256sum *.apk > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
         with:
-          name: Sesame-AG-debug-${{ github.run_number }}
-          path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/outputs/apk/debug/SHA256SUMS.txt
-          retention-days: 7
+          name: Sesame-AG-release-${{ github.run_number }}
+          path: release-apks/*
+          retention-days: 30
           if-no-files-found: error
+  mark-success:
+    needs: [sync, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Mark upstream commit successfully built
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream }}
+          SOURCE_SHA: ${{ needs.sync.outputs.source }}
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/apk-release-$UPSTREAM_SHA" >/dev/null 2>&1; then
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/apk-release-$UPSTREAM_SHA" -f "sha=$SOURCE_SHA"
+          fi
