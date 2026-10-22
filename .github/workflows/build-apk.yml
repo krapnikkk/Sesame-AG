@@ -91,7 +91,8 @@ jobs:
             output="release-apks/$(basename "$apk" .apk)-signed.apk"
             "$tools/apksigner" sign --ks "$key" --ks-type PKCS12 --ks-pass env:KEYSTORE_PASSWORD --out "$output" "$apk"
             "$tools/apksigner" verify --verbose --print-certs "$output" > "$RUNNER_TEMP/signature.txt"
-            actual=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/signature.txt" | tr '[:lower:]' '[:upper:]')
+            grep -q '^Number of signers: 1$' "$RUNNER_TEMP/signature.txt"
+            actual=$(sed -n 's/^.*certificate SHA-256 digest: //p' "$RUNNER_TEMP/signature.txt" | tr '[:lower:]' '[:upper:]')
             if [[ "$actual" != "$EXPECTED_CERT" ]]; then cat "$RUNNER_TEMP/signature.txt"; echo "Certificate mismatch: expected $EXPECTED_CERT, got $actual" >&2; exit 1; fi
             "$tools/aapt2" dump badging "$output" > "$RUNNER_TEMP/badging.txt"
             if grep -q '^application-debuggable' "$RUNNER_TEMP/badging.txt"; then
