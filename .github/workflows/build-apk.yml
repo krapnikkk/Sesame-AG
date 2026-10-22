@@ -108,8 +108,47 @@ jobs:
           path: release-apks/*
           retention-days: 30
           if-no-files-found: error
-  mark-success:
+  publish:
     needs: [sync, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Sesame-AG-release-${{ github.run_number }}
+          path: release-apks
+      - name: Publish verified APKs to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ needs.sync.outputs.source }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-apks
+          sha256sum --check SHA256SUMS.txt
+          tag="dev-build-$GITHUB_RUN_NUMBER"
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo 'Release APKs built from upstream dev, signed with the persistent key of this fork.'
+            echo
+            echo 'Choose app-arm64-v8a-release-signed.apk for most modern Android phones, or app-universal-release-signed.apk if unsure.'
+            echo
+            echo "Upstream commit: $UPSTREAM_SHA"
+            echo "Fork source commit: $SOURCE_SHA"
+            echo "Build: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo 'These are self-signed Release builds, not upstream official packages. APKs, checksums and build metadata are attached below.'
+          } > "$notes"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Sesame-AG dev Release #$GITHUB_RUN_NUMBER" --notes-file "$notes" --draft
+          fi
+          gh release upload "$tag" *.apk SHA256SUMS.txt BUILD-INFO.txt --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "Download: https://github.com/$GITHUB_REPOSITORY/releases/latest" >> "$GITHUB_STEP_SUMMARY"
+  mark-success:
+    needs: [sync, publish]
     runs-on: ubuntu-latest
     permissions:
       contents: write
