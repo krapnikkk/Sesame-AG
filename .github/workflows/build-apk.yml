@@ -86,13 +86,13 @@ jobs:
           mkdir -p release-apks
           shopt -s nullglob
           apks=(app/build/outputs/apk/release/*.apk)
-          (( ${#apks[@]} > 0 ))
+          if (( ${#apks[@]} == 0 )); then find app/build/outputs -type f; echo "No Release APKs found" >&2; exit 1; fi
           for apk in "${apks[@]}"; do
             output="release-apks/$(basename "$apk" .apk)-signed.apk"
             "$tools/apksigner" sign --ks "$key" --ks-type PKCS12 --ks-pass env:KEYSTORE_PASSWORD --out "$output" "$apk"
             "$tools/apksigner" verify --verbose --print-certs "$output" > "$RUNNER_TEMP/signature.txt"
             actual=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/signature.txt" | tr '[:lower:]' '[:upper:]')
-            [[ "$actual" == "$EXPECTED_CERT" ]]
+            if [[ "$actual" != "$EXPECTED_CERT" ]]; then cat "$RUNNER_TEMP/signature.txt"; echo "Certificate mismatch: expected $EXPECTED_CERT, got $actual" >&2; exit 1; fi
             "$tools/aapt2" dump badging "$output" > "$RUNNER_TEMP/badging.txt"
             if grep -q '^application-debuggable' "$RUNNER_TEMP/badging.txt"; then
               echo 'Refusing debuggable APK' >&2
